@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import set_key
 from .db import dumps, stamp
 from .http import HTTP, APIError, AmbiguousSend
-from .matching import contact_phones, name_queries, name_score
+from .matching import contact_phones
 
 
 class CRM:
@@ -102,33 +102,6 @@ class CRM:
                 if normalized in contact_phones(contact):
                     contacts[contact["id"]] = contact
         return list(contacts.values())
-
-    async def refresh_index(self):
-        contacts = []
-        async for contact in self.collection("/api/v4/contacts", "contacts"):
-            contacts.append((contact["id"], dumps(contact)))
-        async with self.db.transaction():
-            await self.db.execute("DELETE FROM contact_index")
-            await self.db.conn.executemany("INSERT INTO contact_index VALUES(?,?)", contacts)
-            await self.db.set_setting("contact_index_at", stamp())
-
-    async def by_name(self, name):
-        import json
-        from datetime import datetime
-        from .db import now
-        indexed = await self.db.setting("contact_index_at", "")
-        if not indexed or (now() - datetime.fromisoformat(indexed)).total_seconds() > self.config.contact_index_seconds:
-            await self.refresh_index()
-        contacts = {x["id"]: json.loads(x["payload"]) for x in await self.db.all("SELECT * FROM contact_index")}
-        for query in name_queries(name):
-            async for item in self.collection("/api/v4/contacts", "contacts", {"query": query}):
-                contacts[item["id"]] = item
-        def rank():
-            scored = [(name_score(name, x.get("name", "")), x) for x in contacts.values() if not x.get("is_deleted")]
-            return [dict(item, match_score=round(score, 3)) for score, item in
-                    sorted(scored, key=lambda x: (-x[0], x[1]["id"])) if score >= 0.60][:30]
-        # Fuzzy matching is CPU work; webhook ingestion stays responsive during ranking.
-        return await asyncio.to_thread(rank)
 
     async def write_note(self, key):
         note = await self.db.one("SELECT * FROM crm_notes WHERE key=?", (key,))

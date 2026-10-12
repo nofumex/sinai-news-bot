@@ -1,7 +1,0 @@
-{$PUBLIC_HOST} {
-    # Do not enable access logging: amoCRM's webhook path contains its secret.
-    request_body {
-        max_size 256KB
-    }
-    reverse_proxy bot:8000
-}

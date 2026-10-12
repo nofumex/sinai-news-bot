@@ -33,7 +33,7 @@ class Scheduler:
         return int(await self.db.setting(segment + "_interval_months", fallback))
 
     async def channel(self, client):
-        subscriptions = await self.db.all("SELECT * FROM subscriptions WHERE client_id=? AND stopped=0 AND blocked=0 AND state='confirmed' ORDER BY id",
+        subscriptions = await self.db.all("SELECT * FROM subscriptions WHERE client_id=? AND stopped=0 AND blocked=0 AND state IN ('confirmed','registered') ORDER BY id",
                                           (client["id"],))
         available = [s for s in subscriptions if (self.config.tg_bot_token if s["platform"] == "telegram" else self.config.max_bot_token).get_secret_value()]
         return next((s for s in available if s["platform"] == client["preferred_platform"]), available[0] if available else None)
@@ -41,14 +41,16 @@ class Scheduler:
     async def plan(self, current=None):
         current = current or now()
         result = []
-        for client in await self.db.all("SELECT * FROM clients WHERE opted_out=0 ORDER BY id"):
+        for client in await self.db.all("SELECT * FROM clients WHERE opted_out=0 AND merged_into IS NULL ORDER BY id"):
             sub = await self.channel(client)
             if not sub:
                 continue
             interval = await self.interval(client["segment"])
             anchor = datetime.fromisoformat(client["subscribed_at"])
             cycle = latest_cycle(anchor, current, interval)
-            last = await self.db.one("SELECT MAX(cycle) AS cycle FROM deliveries WHERE client_id=?", (client["id"],))
+            family = await self.db.family(client['id'])
+            marks = ','.join('?' for _ in family)
+            last = await self.db.one(f"SELECT MAX(cycle) AS cycle FROM deliveries WHERE client_id IN ({marks})", family)
             previous = last["cycle"] or 0
             next_cycle = cycle if cycle > previous else ((max(cycle, previous) // interval) + 1) * interval
             result.append({"client_id": client["id"], "name": client["name"], "subscription_id": sub["id"],
@@ -75,14 +77,19 @@ class Scheduler:
             return
         if self.config.test_mode or not self.config.broadcasts_enabled:
             raise RetryLater("broadcasts_disabled", 3600)
-        await self.service.crm.verify_pipeline()
+        bound = await self.db.one('SELECT 1 FROM subscriptions WHERE client_id=? AND claimed_lead_id IS NOT NULL', ((await self.db.canonical(row['client_id']))['id'],))
+        if bound:
+            await self.service.crm.verify_pipeline()
         # Fresh CRM check before each send. A CRM outage prevents sending the wrong segment.
         await self.service.reconcile_client(row["client_id"])
-        client = await self.db.one("SELECT * FROM clients WHERE id=?", (row["client_id"],))
+        client = await self.db.canonical(row['client_id'])
         sub = await self.channel(client)
         interval = await self.interval(client["segment"])
         cycle = latest_cycle(datetime.fromisoformat(client["subscribed_at"]), now(), interval)
-        if client["opted_out"] or not sub or row["cycle"] != cycle:
+        family = await self.db.family(client['id'])
+        marks = ','.join('?' for _ in family)
+        duplicate = await self.db.one(f"SELECT 1 FROM deliveries WHERE client_id IN ({marks}) AND id<>? AND state IN ('sent','sending','unknown') AND COALESCE(sent_at,created_at)>=?", (*family, delivery_id, stamp(anniversary(datetime.fromisoformat(client['subscribed_at']), cycle))))
+        if client["opted_out"] or not sub or row["cycle"] != cycle or duplicate:
             await self.db.execute("UPDATE deliveries SET state='skipped',error='unsubscribed/no_channel/stale_cycle' WHERE id=?", (delivery_id,))
             return
         text = COMPLETED_TEXT if client["segment"] == "completed" else ACTIVE_TEXT

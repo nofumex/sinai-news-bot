@@ -66,7 +66,7 @@ async def test_one_channel_for_two_accounts(system):
     system.platforms['max'].send.assert_not_awaited()
 
 
-async def test_completed_initial_and_changed_segment_sticky(system):
+async def test_crm_move_has_priority_and_preserves_anchor(system):
     system.crm.leads[201]['pipeline_id'] = 8993570
     sub = await prepare(system)
     client = await system.db.one("SELECT * FROM clients")
@@ -74,7 +74,7 @@ async def test_completed_initial_and_changed_segment_sticky(system):
     anchor = client['subscribed_at']
     system.crm.leads[201]['pipeline_id'] = 1312204
     await system.service.reconcile_client(client['id'])
-    assert (await system.db.one("SELECT * FROM clients"))['segment'] == 'completed'
+    assert (await system.db.one("SELECT * FROM clients"))['segment'] == 'active'
     assert (await system.db.one("SELECT * FROM clients"))['subscribed_at'] == anchor
     assert sub['selected_segment'] == 'active'
 
@@ -95,7 +95,7 @@ async def test_completed_on_other_linked_lead(system):
     from conftest import subscriber
     sid = await subscriber(system)
     sub = await system.db.one("SELECT * FROM subscriptions WHERE id=?", (sid,))
-    await system.service.bind(sub, {'contact_id': 101, 'lead_id': 201}, 'manual', 'admin')
+    await system.service.attach(sub, await system.crm.lead(201), 'phone', await system.crm.contact(101))
     assert (await system.db.one("SELECT * FROM clients"))['segment'] == 'completed'
 
 
@@ -169,13 +169,13 @@ async def test_blocked_channel_falls_back(system):
     system.platforms['max'].send.assert_awaited_once()
 
 
-async def test_changed_phone_pauses_broadcast(system):
+async def test_changed_phone_does_not_force_manual_registration(system):
     await prepare(system)
     await system.scheduler.tick()
     system.crm.contacts[101]['custom_fields_values'][0]['values'][0]['value'] = '79990000000'
     await system.scheduler.deliver((await system.db.one("SELECT * FROM deliveries"))['id'])
-    system.platforms['telegram'].send.assert_not_awaited()
-    assert await system.db.one("SELECT * FROM reviews WHERE status='pending'")
+    system.platforms['telegram'].send.assert_awaited_once()
+    assert not await system.db.one("SELECT * FROM reviews WHERE status='pending'")
 
 
 async def test_recovery_marks_sending_unknown(system):

@@ -7,6 +7,7 @@ class Telegram:
     def __init__(self, config, http=None):
         self.config = config
         self.http = http or HTTP("telegram", interval=1.05)
+        self.poll_http = HTTP('telegram-poll', interval=0.5)
         self.base = "https://api.telegram.org/bot" + config.tg_bot_token.get_secret_value() + "/"
 
     async def call(self, method, data, safe=False):
@@ -57,7 +58,19 @@ class Telegram:
             return None
         return Incoming("telegram", sender["id"], message["chat"]["id"], message.get("text", ""),
                         callback.get("data", "") if callback else "", callback.get("id", "") if callback else "",
-                        message.get("contact") if not callback else None)
+                        message.get("contact") if not callback else None, raw=message)
+
+    async def poll(self, cursor):
+        data = {'timeout': self.config.poll_timeout, 'limit': 100,
+                'allowed_updates': ['message', 'callback_query', 'my_chat_member']}
+        if cursor is not None:
+            data['offset'] = int(cursor)
+        result = await self.poll_http.request('POST', self.base+'getUpdates', json=data,
+                                              timeout=self.config.poll_timeout+10)
+        if not result.get('ok'):
+            raise APIError('telegram-poll', result.get('error_code', 400))
+        updates = result.get('result', [])
+        return updates, max((x['update_id']+1 for x in updates), default=cursor)
 
     def verify_contact(self, contact, user_id):
         if contact.get("user_id") != user_id:

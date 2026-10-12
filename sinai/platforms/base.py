@@ -11,6 +11,7 @@ class Incoming:
     callback_id: str = ""
     contact: dict | None = None
     stopped: bool = False
+    raw: dict | None = None
 
 
 def button(text, data):

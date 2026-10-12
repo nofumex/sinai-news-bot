@@ -5,7 +5,9 @@ import pytest
 from sinai.admin import Admin
 from sinai.config import Settings
 from sinai.db import Database, stamp
-from sinai.matching import contact_phones, name_score
+from sinai.matching import contact_phones
+from sinai.campaigns import Campaigns
+from sinai.http import APIError
 from sinai.platforms import Telegram, Max
 from sinai.scheduler import Scheduler
 from sinai.service import Service
@@ -30,6 +32,8 @@ class FakeCRM:
 
     async def lead(self, lid):
         self.lead_reads += 1
+        if lid not in self.leads:
+            raise APIError('amoCRM',404)
         return copy.deepcopy(self.leads[lid])
 
     async def leads_for(self, contact):
@@ -37,10 +41,6 @@ class FakeCRM:
 
     async def by_phone(self, number):
         return [copy.deepcopy(x) for x in self.contacts.values() if number in contact_phones(x)]
-
-    async def by_name(self, name):
-        return [dict(copy.deepcopy(x), match_score=name_score(name, x['name'])) for x in self.contacts.values()
-                if name_score(name, x['name']) >= .60]
 
     async def write_note(self, key):
         self.notes.append(key)
@@ -60,10 +60,12 @@ async def system(tmp_path):
     service = Service(config, db, crm, platforms)
     scheduler = Scheduler(config, db, service)
     service.admin = Admin(config, db, service, scheduler)
+    service.campaigns = Campaigns(config,db,service,scheduler)
     worker = Worker(config, db, service, scheduler)
     yield SimpleNamespace(config=config, db=db, crm=crm, platforms=platforms, service=service, scheduler=scheduler, worker=worker)
     for platform in platforms.values():
         await platform.http.close()
+        await platform.poll_http.close()
     await db.close()
 
 
@@ -77,6 +79,8 @@ async def registered(system, **kwargs):
     sid = await subscriber(system, **kwargs)
     system.service.context = "registration-" + str(sid)
     system.service.sequence = 0
+    sub = await system.db.one('SELECT * FROM subscriptions WHERE id=?',(sid,))
+    await system.service.register_local(sub)
     await system.service.sync(sid)
     return await system.db.one("SELECT * FROM subscriptions WHERE id=?", (sid,))
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ class Database:
     def __init__(self, path: Path):
         self.path = path
         self.lock = asyncio.Lock()
+        self.owner = None
         self.conn = None
 
     async def open(self):
@@ -36,17 +38,49 @@ class Database:
         await self.conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT)")
         for file in sorted((Path(__file__).parent / "migrations").glob("*.sql")):
             if not await self.one("SELECT version FROM schema_migrations WHERE version=?", (file.stem,)):
-                script = "BEGIN IMMEDIATE;\n" + file.read_text(encoding="utf-8")
-                script += f"\nINSERT INTO schema_migrations VALUES ('{file.stem}', '{stamp()}');\nCOMMIT;"
-                await self.conn.executescript(script)
+                rebuild = file.stem == "003_polling_registration_campaigns"
+                if rebuild:
+                    await self.execute("PRAGMA foreign_keys=OFF")
+                try:
+                    await self.execute("BEGIN IMMEDIATE")
+                    # Recheck inside the SQLite write lock for concurrent migration callers.
+                    if not await self.one("SELECT version FROM schema_migrations WHERE version=?", (file.stem,)):
+                        statement = ""
+                        for line in file.read_text(encoding="utf-8").splitlines(True):
+                            statement += line
+                            if sqlite3.complete_statement(statement):
+                                await self.execute(statement)
+                                statement = ""
+                        if statement.strip():
+                            raise ValueError("Incomplete migration statement")
+                        if await self.all("PRAGMA foreign_key_check"):
+                            raise ValueError("Migration foreign key check failed")
+                        await self.execute("INSERT INTO schema_migrations VALUES(?,?)", (file.stem, stamp()))
+                    await self.execute("COMMIT")
+                except BaseException:
+                    await self.execute("ROLLBACK")
+                    raise
+                finally:
+                    if rebuild:
+                        await self.execute("PRAGMA foreign_keys=ON")
+
+    async def canonical(self, client_id):
+        for _ in range(100):
+            row = await self.one("SELECT * FROM clients WHERE id=?", (client_id,))
+            if not row or row["merged_into"] is None:
+                return row
+            client_id = row["merged_into"]
+        raise ValueError("Client merge cycle")
 
     async def close(self):
         if self.conn:
             await self.conn.close()
 
     async def execute(self, sql, args=()):
-        cursor = await self.conn.execute(sql, args)
-        return cursor
+        if self.owner is asyncio.current_task():
+            return await self.conn.execute(sql, args)
+        async with self.lock:
+            return await self.conn.execute(sql, args)
 
     async def one(self, sql, args=()):
         cursor = await self.execute(sql, args)
@@ -63,13 +97,23 @@ class Database:
     @asynccontextmanager
     async def transaction(self):
         async with self.lock:
-            await self.execute("BEGIN IMMEDIATE")
+            self.owner = asyncio.current_task()
             try:
+                await self.execute("BEGIN IMMEDIATE")
                 yield self
                 await self.execute("COMMIT")
             except BaseException:
                 await self.execute("ROLLBACK")
                 raise
+            finally:
+                self.owner = None
+
+    async def family(self, client_id):
+        root = await self.canonical(client_id)
+        if not root:
+            return []
+        rows = await self.all('WITH RECURSIVE family(id) AS (SELECT ? UNION ALL SELECT c.id FROM clients c JOIN family f ON c.merged_into=f.id) SELECT id FROM family', (root['id'],))
+        return [r['id'] for r in rows]
 
     async def event(self, kind, sub_id=None, client_id=None, detail=None):
         await self.execute("INSERT INTO events(kind,subscription_id,client_id,detail,created_at) VALUES(?,?,?,?,?)",

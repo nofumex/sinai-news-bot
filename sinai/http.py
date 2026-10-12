@@ -55,6 +55,12 @@ class HTTP:
                         raise RetryLater(self.service) from None
                 if response.status_code < 500:
                     if response.status_code >= 400:
+                        try:
+                            code = response.json().get('code')
+                        except ValueError:
+                            code = None
+                        if code == 'attachment.not.ready':
+                            raise RetryLater(self.service, 15)
                         # No URLs/body in errors: Telegram URLs contain the bot credential.
                         raise APIError(self.service, response.status_code)
                     try:

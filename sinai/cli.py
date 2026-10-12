@@ -5,7 +5,6 @@ import os
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
-import uvicorn
 from filelock import FileLock
 from .config import load_settings
 from .crm import CRM
@@ -35,27 +34,30 @@ async def run_command(command):
                 if config.max_bot_token.get_secret_value():
                     info = await max_bot.call("GET", "/me", safe=True)
                     print("MAX username:", info.get('username'))
-            elif command == "setup-webhooks":
-                if config.test_mode or not config.public_base_url.startswith("https://"):
-                    raise ValueError("Set TEST_MODE=false and HTTPS PUBLIC_BASE_URL before webhook setup")
-                base = config.public_base_url.rstrip("/")
+            elif command == "setup-polling":
                 if config.tg_bot_token.get_secret_value():
-                    await tg.call("setWebhook", {"url": base + "/webhooks/telegram", "secret_token": config.tg_webhook_secret.get_secret_value(),
-                                                "allowed_updates": ["message", "callback_query", "my_chat_member"], "drop_pending_updates": False}, safe=True)
-                    print("Telegram webhook registered")
+                    await tg.call('deleteWebhook',{'drop_pending_updates':False},safe=True)
+                    print('Telegram polling enabled; pending updates preserved')
                 if config.max_bot_token.get_secret_value():
-                    await max_bot.call("POST", "/subscriptions", json={"url": base + "/webhooks/max", "secret": config.max_webhook_secret.get_secret_value(),
-                                        "update_types": ["bot_started", "bot_stopped", "message_created", "message_callback"]}, safe=True)
-                    print("MAX webhook registered")
-                # CRM configuration is deliberately explicit; no changes to existing hooks.
-                print("amoCRM: configure status_lead, update_lead with PUBLIC_BASE_URL + /webhooks/amo/ + AMO_WEBHOOK_SECRET")
+                    data = await max_bot.call('GET','/subscriptions',safe=True)
+                    for item in data.get('subscriptions',[]):
+                        await max_bot.call('DELETE','/subscriptions',params={'url':item['url']},safe=True)
+                    print('MAX webhook subscriptions removed for this bot')
+                print('amoCRM uses periodic reads; existing CRM webhooks are not modified')
             elif command == "plan":
                 service = Service(config, db, crm, {"telegram": tg, "max": max_bot})
                 print(json.dumps(await Scheduler(config, db, service).plan(), ensure_ascii=True, indent=2))
             elif command == "reconcile":
-                for row in await db.all("SELECT id FROM clients"):
+                for row in await db.all("SELECT id FROM clients WHERE merged_into IS NULL"):
                     await db.enqueue(f"cli-reconcile:{stamp()}:{row['id']}", "reconcile_client", {"client_id": row['id']})
                 print("Reconciliation queued")
+                for row in await db.all('SELECT id FROM subscriptions WHERE phone IS NOT NULL AND identity_verified=0'):
+                    await db.enqueue(f"cli-sync:{stamp()}:{row['id']}",'sync',{'subscription_id':row['id']})
+            elif command == 'migrate':
+                print('Database migrations applied and foreign keys verified')
+            elif command == 'status':
+                print(json.dumps({'cursors':await db.all("SELECT key,value FROM settings WHERE key LIKE 'poll_cursor:%' OR key LIKE 'last_poll:%'"),
+                                  'jobs':await db.all('SELECT state,COUNT(*) n FROM jobs GROUP BY state')},ensure_ascii=True))
             elif command == "replay-test-notes":
                 if config.test_mode or not config.crm_notes_enabled:
                     raise ValueError("Set TEST_MODE=false and CRM_NOTES_ENABLED=true")
@@ -73,17 +75,33 @@ async def run_command(command):
         finally:
             await crm.http.close()
             await tg.http.close()
+            await tg.poll_http.close()
             await max_bot.http.close()
+            await max_bot.poll_http.close()
             await db.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Sinai bot operations")
-    parser.add_argument("command", choices=["serve", "doctor", "setup-webhooks", "plan", "reconcile", "replay-test-notes", "backup", "prune"])
+    parser.add_argument("command", choices=["serve", "doctor", "setup-polling", "migrate", "status", "health", "plan", "reconcile", "replay-test-notes", "backup", "prune"])
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.command == "serve":
-        uvicorn.run("sinai.app:create_app", factory=True, host="0.0.0.0", port=8000, workers=1, access_log=False)
+        from .app import serve
+        try:
+            asyncio.run(serve())
+        except KeyboardInterrupt:
+            pass
+    elif args.command in {'status','health'}:
+        config = load_settings()
+        with sqlite3.connect(f"file:{config.database_path.resolve().as_posix()}?mode=ro",uri=True) as db:
+            state = dict(db.execute("SELECT key,value FROM settings WHERE key LIKE 'poll_cursor:%' OR key LIKE 'last_poll:%' OR key='worker_heartbeat'"))
+            if args.command == 'health':
+                from datetime import datetime
+                if not state.get('worker_heartbeat') or (now()-datetime.fromisoformat(state['worker_heartbeat'])).total_seconds() > 180:
+                    raise SystemExit(1)
+            else:
+                print(json.dumps({'runtime':state,'jobs':dict(db.execute('SELECT state,COUNT(*) FROM jobs GROUP BY state'))},ensure_ascii=True))
     elif args.command == "backup":
         config = load_settings()
         target = args.output or Path("backups") / (now().strftime("%Y%m%d-%H%M%S") + ".sqlite3")

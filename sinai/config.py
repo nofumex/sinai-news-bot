@@ -22,10 +22,6 @@ class Settings(BaseSettings):
     max_bot_token: SecretStr = SecretStr("")
     tg_bot_username: str = "sinai_news_bot"
     max_bot_username: str = ""
-    tg_webhook_secret: SecretStr = SecretStr("")
-    max_webhook_secret: SecretStr = SecretStr("")
-    amo_webhook_secret: SecretStr = SecretStr("")
-    public_base_url: str = ""
     database_path: Path = Path("data/sinai.sqlite3")
     test_mode: bool = True
     broadcasts_enabled: bool = False
@@ -35,9 +31,14 @@ class Settings(BaseSettings):
     completed_interval_months: Literal[1, 2] = 1
     preferred_platform: Literal["telegram", "max"] = "telegram"
     reconciliation_seconds: int = Field(default=3600, ge=60)
-    contact_index_seconds: int = Field(default=86400, ge=60)
     max_contact_pages: int = Field(default=1000, ge=1)
-    link_ttl_seconds: int = Field(default=604800, ge=60)
+    polling_enabled: bool = False
+    poll_timeout: int = Field(default=25, ge=1, le=60)
+    max_poll_min_seconds: float = Field(default=2, ge=1)
+    lead_start_limit: int = Field(default=5, ge=1)
+    lead_start_global_limit: int = Field(default=100, ge=1)
+    lead_start_window_seconds: int = Field(default=3600, ge=60)
+    media_max_bytes: int = Field(default=20_000_000, ge=1024, le=50_000_000)
     max_ca_bundle: str = ""
     log_level: str = "INFO"
 
@@ -45,14 +46,6 @@ class Settings(BaseSettings):
     def validate_production(self):
         if not self.amocrm_base_url.startswith("https://"):
             raise ValueError("AMOCRM_BASE_URL requires HTTPS")
-        if not self.test_mode:
-            if not self.public_base_url.startswith("https://"):
-                raise ValueError("PUBLIC_BASE_URL requires HTTPS in production")
-            required = [(self.tg_bot_token, self.tg_webhook_secret), (self.max_bot_token, self.max_webhook_secret)]
-            if any(t.get_secret_value() and len(s.get_secret_value()) < 32 for t, s in required):
-                raise ValueError("Webhook secrets must contain at least 32 characters")
-            if len(self.amo_webhook_secret.get_secret_value()) < 32:
-                raise ValueError("AMO_WEBHOOK_SECRET must contain at least 32 characters")
         return self
 
     def admin(self, platform: str, user_id: int) -> bool:

@@ -28,18 +28,6 @@ async def test_phone_query_verifies_actual_phone_and_paginates(system):
         await crm.http.close()
 
 
-async def test_name_fuzzy_scan_and_local_ranking(system):
-    def handler(request):
-        return httpx.Response(200, json={'_embedded': {'contacts': [crm_contact(), crm_contact(102, 'Смирнов Петр Петрович')]}})
-    crm = CRM(system.config, system.db, mock_http(handler))
-    try:
-        results = await crm.by_name('Иваноф Иван Иванович')
-        assert results[0]['id'] == 101
-        assert results[0]['match_score'] > .9
-    finally:
-        await crm.http.close()
-
-
 async def test_crm_forbids_creation_and_mutation(system):
     crm = CRM(system.config, system.db)
     try:

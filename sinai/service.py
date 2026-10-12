@@ -1,34 +1,81 @@
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from .db import stamp, dumps
-from .links import issue, parse_lead, token_hash
+from .db import now, stamp, dumps
+from .http import APIError
+from .links import parse_lead
 from .matching import contact_phones
-from .platforms.base import button, link_button
+from .platforms.base import Incoming, button
 
 WELCOME = 'Добро пожаловать! Это официальный чат-бот компании „Синай“. Здесь мы будем отправлять вам особенно важные новости'
-SEGMENTS = {"active": "Действующий клиент", "completed": "Процедура завершена"}
+UNAVAILABLE = 'Ссылка недоступна. Откройте /start без параметра, чтобы подписаться без привязки к CRM.'
 
 
 class Service:
     def __init__(self, config, db, crm, platforms):
         self.config, self.db, self.crm, self.platforms = config, db, crm, platforms
-        self.context = ""
-        self.sequence = 0
-        self.admin = None
+        self.context, self.sequence = '', 0
+        self.admin = self.campaigns = None
 
     async def say(self, incoming, text, buttons=None, **kwargs):
         self.sequence += 1
-        key = f"reply:{self.context}:{self.sequence}"
-        await self.db.enqueue(key, "message", {"platform": incoming.platform, "user_id": incoming.user_id,
-                             "chat_id": incoming.chat_id, "text": text, "buttons": buttons, **kwargs})
+        await self.db.enqueue(f'reply:{self.context}:{self.sequence}', 'message',
+                              {'platform': incoming.platform, 'user_id': incoming.user_id, 'chat_id': incoming.chat_id,
+                               'text': text, 'buttons': buttons, **kwargs})
+
+    async def tell_sub(self, sub, text):
+        await self.say(Incoming(sub['platform'], sub['user_id'], sub['chat_id']), text)
 
     async def subscription(self, incoming):
-        await self.db.execute("INSERT INTO subscriptions(platform,user_id,chat_id,created_at) VALUES(?,?,?,?) "
-                              "ON CONFLICT(platform,user_id) DO UPDATE SET chat_id=excluded.chat_id",
+        await self.db.execute('INSERT INTO subscriptions(platform,user_id,chat_id,created_at) VALUES(?,?,?,?) '
+                              'ON CONFLICT(platform,user_id) DO UPDATE SET chat_id=excluded.chat_id',
                               (incoming.platform, incoming.user_id, incoming.chat_id, stamp()))
-        return await self.db.one("SELECT * FROM subscriptions WHERE platform=? AND user_id=?",
-                                 (incoming.platform, incoming.user_id))
+        return await self.db.one('SELECT * FROM subscriptions WHERE platform=? AND user_id=?', (incoming.platform, incoming.user_id))
+
+    async def allow_lead_lookup(self, sub):
+        async with self.db.transaction():
+            allowed = True
+            for key, limit in [(f"lead:{sub['platform']}:{sub['user_id']}", self.config.lead_start_limit),
+                               ('lead:global', self.config.lead_start_global_limit)]:
+                row = await self.db.one('SELECT * FROM rate_windows WHERE key=?', (key,))
+                if not row or datetime.fromisoformat(row['started_at']) < now()-timedelta(seconds=self.config.lead_start_window_seconds):
+                    await self.db.execute('INSERT INTO rate_windows VALUES(?,?,1) ON CONFLICT(key) DO UPDATE SET started_at=excluded.started_at,count=1', (key, stamp()))
+                else:
+                    await self.db.execute('UPDATE rate_windows SET count=count+1 WHERE key=?', (key,))
+                    allowed = allowed and row['count'] < limit
+            if not allowed:
+                await self.db.event('lead_lookup_limited', sub['id'])
+            return allowed
+
+    async def claim_numeric(self, sub, lead_id):
+        existing = await self.db.one('SELECT * FROM lead_claims WHERE lead_id=?', (lead_id,))
+        if existing and existing['subscription_id'] == sub['id']:
+            return True
+        if existing and sub['claimed_lead_id'] == lead_id and sub['client_id'] and existing['client_id']:
+            if (await self.db.canonical(sub['client_id']))['id'] == (await self.db.canonical(existing['client_id']))['id']:
+                return True  # Already linked through a verified phone/admin merge, no new occupation.
+        if sub['claimed_lead_id'] or (sub['client_id'] and sub['crm_method']):
+            return False
+        if not await self.allow_lead_lookup(sub):
+            return False
+        try:
+            lead = await self.crm.lead(lead_id)
+        except APIError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        if lead.get('id') != lead_id or lead.get('is_deleted'):
+            return False
+        async with self.db.transaction():
+            await self.db.execute("INSERT OR IGNORE INTO lead_claims VALUES(?,?,?,'numeric_unverified',?,?,?,?)",
+                                  (lead_id, sub['id'], sub['client_id'], lead['pipeline_id'], lead['status_id'], stamp(), stamp()))
+            owner = await self.db.one('SELECT * FROM lead_claims WHERE lead_id=?', (lead_id,))
+            if owner is None or owner['subscription_id'] != sub['id']:
+                await self.db.event('lead_claim_conflict', sub['id'], detail={'lead_id': lead_id})
+                return False
+            await self.db.execute("UPDATE subscriptions SET claimed_lead_id=?,crm_method='numeric_unverified',identity_verified=0 WHERE id=?", (lead_id, sub['id']))
+            await self.cache_lead(lead)
+            await self.db.event('lead_claimed', sub['id'], detail={'lead_id': lead_id, 'identity_verified': False})
+        return True
 
     async def handle(self, platform, update, context):
         self.context, self.sequence = context, 0
@@ -36,302 +83,242 @@ class Service:
         if not incoming:
             return
         if incoming.callback_id:
-            # Callback acknowledgements expire; a failure must not replay an admin decision.
             try:
                 await self.platforms[platform].answer(incoming.callback_id)
-            except Exception:
+            except APIError:
                 pass
-        if incoming.text == "/admin" or incoming.callback.startswith("admin:"):
+        if incoming.text == '/message' or incoming.callback.startswith('campaign:'):
+            if self.config.admin(platform, incoming.user_id):
+                await self.campaigns.handle(incoming)
+            else:
+                await self.say(incoming, 'Доступ запрещён.')
+            return
+        if incoming.text == '/admin' or incoming.callback.startswith('admin:'):
             if self.config.admin(platform, incoming.user_id):
                 await self.admin.handle(incoming)
             else:
-                await self.say(incoming, "Доступ запрещён.")
+                await self.say(incoming, 'Доступ запрещён.')
             return
-        if incoming.text.startswith("/match"):
-            await self.admin.manual_candidate(incoming)
-            return
-        if incoming.text.startswith("/link") or incoming.callback.startswith("link:"):
-            if not self.config.manager(platform, incoming.user_id):
-                await self.say(incoming, "Доступ запрещён.")
+        if self.config.admin(platform, incoming.user_id):
+            if await self.admin.consume(incoming) or await self.campaigns.consume(incoming):
                 return
-            await self.manager_link(incoming)
+        if incoming.text.startswith('/link'):
+            if not self.config.manager(platform, incoming.user_id):
+                await self.say(incoming, 'Доступ запрещён.')
+                return
+            try:
+                _, value = incoming.text.split()
+                lid = parse_lead(value, self.config.amocrm_base_url)
+                await self.crm.lead(lid)
+                urls = [f'https://t.me/{self.config.tg_bot_username}?start={lid}']
+                if self.config.max_bot_username:
+                    urls.append(f'https://max.ru/{self.config.max_bot_username}?start={lid}')
+                await self.say(incoming, 'Ссылки занимают сделку первым открывшим аккаунтом; личность не проверяется.\n'+'\n'.join(urls))
+            except (ValueError, APIError):
+                await self.say(incoming, 'Укажите /link ID или URL существующей сделки.')
             return
         sub = await self.subscription(incoming)
-        if incoming.stopped or incoming.text.strip() == "/stop":
-            async with self.db.transaction():
-                await self.db.execute("UPDATE subscriptions SET stopped=1 WHERE id=?", (sub["id"],))
-                if sub["client_id"]:
-                    await self.db.execute("UPDATE clients SET opted_out=1 WHERE id=?", (sub["client_id"],))
-                    await self.db.execute("UPDATE subscriptions SET stopped=1 WHERE client_id=?", (sub["client_id"],))
-                await self.db.event("unsubscribe", sub["id"], sub["client_id"])
+        if incoming.stopped or incoming.text.strip() == '/stop':
+            await self.opt_out(sub)
             if not incoming.stopped:
-                await self.say(incoming, "Вы отписались от рассылок во всех подключённых каналах. Для возврата — /start.", remove_keyboard=True)
+                await self.say(incoming, 'Вы отписались во всех подключённых каналах. Для возврата — /start.', remove_keyboard=True)
             return
-        if incoming.text.strip().startswith("/start"):
-            payload = incoming.text.strip().split(maxsplit=1)
-            token = payload[1] if len(payload) == 2 else ""
-            if token:
-                async with self.db.transaction():
-                    link = await self.db.one("SELECT * FROM links WHERE token_hash=? AND platform=? AND expires_at>? AND consumed_at IS NULL",
-                                             (token_hash(token), platform, stamp()))
-                    if link and link["claimed_by"] in (None, sub["id"]):
-                        await self.db.execute("UPDATE links SET claimed_by=? WHERE token_hash=?", (sub["id"], token_hash(token)))
-                        await self.db.execute("UPDATE subscriptions SET deep_token_hash=? WHERE id=?", (token_hash(token), sub["id"]))
-                    else:
-                        link = None
-                if not link:
-                    await self.say(incoming, "Ссылка недействительна, истекла или уже использована. Запросите новую у менеджера.")
+        if incoming.text.strip().split(maxsplit=1)[0:1] == ['/start']:
+            parts = incoming.text.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                value = parts[1]
+                if not value.isascii() or not value.isdigit() or not 0 < int(value) < 2**63:
+                    await self.say(incoming, UNAVAILABLE)
                     return
-            elif not sub["client_id"]:
-                await self.db.execute("UPDATE subscriptions SET deep_token_hash=NULL WHERE id=?", (sub["id"],))
-            if sub["client_id"] and not token:
+                if not await self.claim_numeric(sub, int(value)):
+                    await self.say(incoming, UNAVAILABLE)
+                    return
+                sub = await self.db.one('SELECT * FROM subscriptions WHERE id=?', (sub['id'],))
+            if sub['client_id']:
                 async with self.db.transaction():
-                    await self.db.execute("UPDATE subscriptions SET stopped=0,blocked=0 WHERE id=?", (sub["id"],))
-                    await self.db.execute("UPDATE clients SET opted_out=0 WHERE id=?", (sub["client_id"],))
-                    await self.db.event("resubscribe", sub["id"], sub["client_id"])
-                await self.say(incoming, "Ваша подписка возобновлена. /channel — предпочитаемый канал; /stop — отписка.")
+                    client = await self.db.canonical(sub['client_id'])
+                    await self.db.execute('UPDATE subscriptions SET stopped=0,blocked=0 WHERE id=?', (sub['id'],))
+                    await self.db.execute('UPDATE clients SET opted_out=0 WHERE id=?', (client['id'],))
+                    await self.db.event('resubscribe', sub['id'], client['id'])
+                if sub['claimed_lead_id'] and sub['state'] != 'confirmed':
+                    await self.attach(sub, await self.crm.lead(sub['claimed_lead_id']), 'numeric_unverified')
+                await self.say(incoming, 'Вы уже зарегистрированы. Подписка активна; /stop — отписка, /channel — выбор канала.')
                 return
-            await self.say(incoming, WELCOME, [[button("Я действующий клиент", "segment:active")],
-                                             [button("Моя процедура уже завершена", "segment:completed")]])
+            await self.say(incoming, WELCOME, [[button('Я действующий клиент', 'segment:active')], [button('Моя процедура уже завершена', 'segment:completed')]])
             return
-        if incoming.text.strip() == "/channel" and sub["client_id"]:
-            await self.db.execute("UPDATE clients SET preferred_platform=? WHERE id=?", (platform, sub["client_id"]))
-            await self.db.event("channel_changed", sub["id"], sub["client_id"], {"platform": platform})
-            await self.say(incoming, "Этот мессенджер выбран для рассылок.")
-            return
-        if incoming.callback in {"segment:active", "segment:completed"}:
-            if sub["client_id"] and not sub["deep_token_hash"]:
-                await self.say(incoming, "Вы уже зарегистрированы. Сегмент определяется по CRM.")
+        if incoming.callback in {'segment:active', 'segment:completed'}:
+            if sub['client_id']:
+                if sub['claimed_lead_id'] and sub['state'] != 'confirmed':
+                    await self.attach(sub, await self.crm.lead(sub['claimed_lead_id']), 'numeric_unverified')
+                await self.say(incoming, 'Вы уже зарегистрированы. Дата подписки сохранена.')
                 return
-            await self.db.execute("UPDATE subscriptions SET selected_segment=?,state='contact' WHERE id=?",
-                                 (incoming.callback.split(":")[1], sub["id"]))
-            await self.say(incoming, "Для регистрации поделитесь своим контактом кнопкой ниже.", request_contact=True)
+            await self.db.execute("UPDATE subscriptions SET selected_segment=?,state='contact',subscribed_at=COALESCE(subscribed_at,?) WHERE id=?", (incoming.callback.split(':')[1], stamp(), sub['id']))
+            sub = await self.db.one('SELECT * FROM subscriptions WHERE id=?', (sub['id'],))
+            await self.register_local(sub)
+            if sub['claimed_lead_id']:
+                await self.attach(sub, await self.crm.lead(sub['claimed_lead_id']), 'numeric_unverified')
+                await self.say(incoming, 'Регистрация завершена. Вы подписаны на новости «Синай». /stop — отписка.')
+            else:
+                await self.say(incoming, 'Вы подписаны. Можно поделиться своим контактом для связи с CRM или пропустить этот шаг.', request_contact=True)
+                await self.say(incoming, 'Передача контакта необязательна.', [[button('Пропустить', 'contact:skip')]])
+            return
+        if incoming.callback == 'contact:skip':
+            if sub['client_id']:
+                await self.say(incoming, 'Регистрация завершена без передачи контакта. Вы будете получать рассылки выбранной группы.', remove_keyboard=True)
+            return
+        if incoming.text.strip() == '/channel' and sub['client_id']:
+            client = await self.db.canonical(sub['client_id'])
+            await self.db.execute('UPDATE clients SET preferred_platform=? WHERE id=?', (platform, client['id']))
+            await self.say(incoming, 'Этот мессенджер выбран для рассылок.')
             return
         if incoming.contact:
-            if not sub["selected_segment"]:
-                await self.say(incoming, "Сначала выберите статус: /start.")
+            if not sub['client_id']:
+                await self.say(incoming, 'Сначала выберите группу: /start.')
                 return
             try:
                 number = self.platforms[platform].verify_contact(incoming.contact, incoming.user_id)
             except (ValueError, KeyError, TypeError):
-                await self.say(incoming, "Не удалось подтвердить ваш контакт. Отправьте собственный контакт кнопкой ниже.", request_contact=True)
+                await self.say(incoming, 'Контакт не подтверждён. Используйте кнопку отправки своего контакта или пропустите шаг.', request_contact=True)
                 return
-            if sub["client_id"] and number == sub["phone"] and sub["state"] == "confirmed":
-                await self.say(incoming, "Вы уже зарегистрированы.", remove_keyboard=True)
-                return
-            async with self.db.transaction():
-                await self.db.execute("UPDATE subscriptions SET phone=?,subscribed_at=COALESCE(subscribed_at,?),state='syncing',stopped=0,blocked=0 WHERE id=?",
-                                      (number, stamp(), sub["id"]))
-                await self.db.event("contact_verified", sub["id"], sub["client_id"], {"method": platform + "_contact"})
-                await self.db.enqueue(f"sync:{context}:{sub['id']}", "sync", {"subscription_id": sub["id"]})
-            await self.say(incoming, "Контакт подтверждён. Проверяем данные в CRM.", remove_keyboard=True)
+            await self.db.execute('UPDATE subscriptions SET phone=? WHERE id=?', (number, sub['id']))
+            await self.db.event('contact_verified', sub['id'], sub['client_id'], {'method': platform+'_contact'})
+            await self.db.enqueue(f"sync:{context}:{sub['id']}", 'sync', {'subscription_id': sub['id']})
+            await self.say(incoming, 'Контакт принят. Подписка действует независимо от результата проверки CRM.', remove_keyboard=True)
             return
-        if sub["state"] == "name" and incoming.text and not incoming.text.startswith("/"):
-            if not 3 <= len(incoming.text.strip()) <= 150:
-                await self.say(incoming, "Укажите фамилию, имя и отчество (до 150 символов).")
-                return
-            await self.db.execute("UPDATE subscriptions SET name=?,state='syncing' WHERE id=?", (incoming.text.strip(), sub["id"]))
-            await self.db.enqueue(f"name:{context}:{sub['id']}", "sync", {"subscription_id": sub["id"], "by_name": True})
-            await self.say(incoming, "Ищем контакты по ФИО. Результат подтвердит администратор.")
-            return
-        await self.say(incoming, "Регистрация — /start. Отписка — /stop. Выбор канала рассылок — /channel.")
+        await self.say(incoming, 'Подписка — /start. Отписка — /stop. Канал рассылок — /channel.')
 
-    async def tell_sub(self, sub, text):
-        from .platforms.base import Incoming
-        await self.say(Incoming(sub["platform"], sub["user_id"], sub["chat_id"]), text)
-
-    async def candidates(self, contacts):
-        result = []
-        for item in contacts:
-            contact = await self.crm.contact(item["id"])
-            leads = await self.crm.leads_for(contact)
-            for lead in leads:
-                result.append({"contact_id": contact["id"], "lead_id": lead["id"], "name": contact.get("name", ""),
-                               "pipeline_id": lead["pipeline_id"], "status_id": lead["status_id"],
-                               "score": item.get("match_score"), "phone_match": False})
-        return result
-
-    async def sync(self, sub_id, by_name=False):
-        sub = await self.db.one("SELECT * FROM subscriptions WHERE id=?", (sub_id,))
-        if not sub or not sub["phone"] or sub["stopped"]:
-            return
-        if sub["state"] == "confirmed":
-            return
-        if sub["deep_token_hash"]:
-            link = await self.db.one("SELECT * FROM links WHERE token_hash=?", (sub["deep_token_hash"],))
-            if not link or link["expires_at"] <= stamp() or link["claimed_by"] != sub_id or link["consumed_at"]:
-                await self.review(sub, [], "Персональная ссылка истекла или недействительна")
-                return
-            contact = await self.crm.contact(link["contact_id"])
-            lead_ids = {x["id"] for x in contact.get("_embedded", {}).get("leads", [])}
-            lead = await self.crm.lead(link["lead_id"])
-            candidate = {"contact_id": contact["id"], "lead_id": lead["id"], "name": contact.get("name", ""),
-                         "pipeline_id": lead["pipeline_id"], "status_id": lead["status_id"]}
-            exact = await self.crm.by_phone(sub["phone"])
-            if sub["phone"] in contact_phones(contact) and link["lead_id"] in lead_ids and {x['id'] for x in exact} == {contact['id']}:
-                await self.bind(sub, candidate, "deeplink_phone")
-            else:
-                await self.review(sub, [candidate], "Конфликт телефона, связи сделки или неоднозначный номер в персональной ссылке")
-            return
-        contacts = await (self.crm.by_name(sub["name"]) if by_name else self.crm.by_phone(sub["phone"]))
-        if not contacts and not by_name:
-            await self.db.execute("UPDATE subscriptions SET state='name' WHERE id=?", (sub_id,))
-            await self.db.event("phone_not_found", sub_id)
-            await self.tell_sub(sub, "Номер не найден в CRM. Напишите, пожалуйста, фамилию, имя и отчество полностью.")
-            return
-        candidates = await self.candidates(contacts)
-        if not by_name and len(contacts) == 1 and len(candidates) == 1:
-            await self.bind(sub, candidates[0], "phone")
+    async def opt_out(self, sub, *, in_transaction=False):
+        async def update():
+            await self.db.execute('UPDATE subscriptions SET stopped=1 WHERE id=?', (sub['id'],))
+            if sub['client_id']:
+                client = await self.db.canonical(sub['client_id'])
+                await self.db.execute('UPDATE clients SET opted_out=1 WHERE id=?', (client['id'],))
+                await self.db.execute('UPDATE subscriptions SET stopped=1 WHERE client_id=?', (client['id'],))
+            await self.db.event('unsubscribe', sub['id'], sub['client_id'])
+        if in_transaction:
+            await update()
         else:
-            reason = "Совпадение только по ФИО" if by_name and candidates else "Неоднозначная связь контакта и сделки"
-            await self.review(sub, candidates, reason if candidates else "Клиент или связанные сделки не найдены в CRM")
+            async with self.db.transaction():
+                await update()
 
-    async def review(self, sub, candidates, reason):
+    async def register_local(self, sub):
         async with self.db.transaction():
-            await self.db.execute("UPDATE subscriptions SET state=? WHERE id=?", ("review" if candidates else "not_found", sub["id"]))
-            await self.db.execute("INSERT INTO reviews(subscription_id,reason,candidates,created_at) VALUES(?,?,?,?) "
-                                  "ON CONFLICT(subscription_id) WHERE status='pending' DO UPDATE SET reason=excluded.reason,candidates=excluded.candidates,version=reviews.version+1",
-                                  (sub["id"], reason, dumps(candidates), stamp()))
-            review = await self.db.one("SELECT id FROM reviews WHERE subscription_id=? AND status='pending'", (sub["id"],))
-            await self.db.event("review_requested", sub["id"], detail={"reason": reason})
-        await self.tell_sub(sub, "Данные переданы администратору для проверки. После подтверждения мы сообщим вам.")
-        from .platforms.base import Incoming
-        for platform, uid, token in [("telegram", self.config.admin_id, self.config.tg_bot_token),
-                                     ("max", self.config.max_admin_id, self.config.max_bot_token)]:
-            if uid and token.get_secret_value():
-                await self.say(Incoming(platform, uid, uid), f"🔎 Новая заявка №{review['id']}\n{sub.get('name') or 'Контакт подтверждён'}\n{reason}",
-                               [[button("Открыть заявку", f"admin:review:{review['id']}:0")]])
+            current = await self.db.one('SELECT * FROM subscriptions WHERE id=?', (sub['id'],))
+            if current['client_id']:
+                return current['client_id']
+            cursor = await self.db.execute("INSERT INTO clients(name,segment,subscribed_at,preferred_platform,segment_source,created_at,local_subscription_id) VALUES('',?,?,?,'selection',?,?)",
+                                           (sub['selected_segment'] or 'active', sub['subscribed_at'] or stamp(), self.config.preferred_platform, stamp(), sub['id']))
+            cid = cursor.lastrowid
+            await self.db.execute("UPDATE subscriptions SET client_id=?,state='registered',stopped=0,blocked=0,subscribed_at=COALESCE(subscribed_at,?) WHERE id=?", (cid, stamp(), sub['id']))
+            await self.db.event('registered', sub['id'], cid)
+            return cid
 
-    async def bind(self, sub, candidate, method, actor=None, review_id=None):
-        contact = await self.crm.contact(candidate["contact_id"])
-        if sub["client_id"] and method != "manual":
-            previous = await self.db.one("SELECT contact_id FROM clients WHERE id=?", (sub["client_id"],))
-            if previous and previous["contact_id"] != contact["id"]:
-                await self.review(sub, [candidate], "Попытка изменить ранее подтверждённый контакт CRM")
+    async def merge(self, source, target):
+        if source['id'] == target['id']:
+            return target['id']
+        cid = target['id']
+        await self.db.execute('UPDATE subscriptions SET client_id=? WHERE client_id=?', (cid, source['id']))
+        await self.db.execute('UPDATE lead_claims SET client_id=? WHERE client_id=?', (cid, source['id']))
+        await self.db.execute('UPDATE clients SET merged_into=? WHERE id=?', (cid, source['id']))
+        await self.db.execute('UPDATE clients SET subscribed_at=?,opted_out=? WHERE id=?', (min(source['subscribed_at'], target['subscribed_at']), int(bool(source['opted_out'] or target['opted_out'])), cid))
+        if source['opted_out'] or target['opted_out']:
+            await self.db.execute('UPDATE subscriptions SET stopped=1 WHERE client_id=?', (cid,))
+        await self.db.event('clients_merged', client_id=cid, detail={'source_id': source['id']})
+        return cid
+
+    async def attach(self, sub, lead, method, contact=None, actor=None):
+        verified = method == 'phone'
+        actual_leads = await self.crm.leads_for(contact) if verified else [lead]
+        cid = await self.register_local(sub)
+        async with self.db.transaction():
+            sub = await self.db.one('SELECT * FROM subscriptions WHERE id=?', (sub['id'],))
+            if sub['claimed_lead_id'] and sub['claimed_lead_id'] != lead['id']:
+                return False
+            source = await self.db.canonical(sub['client_id'] or cid)
+            owner = await self.db.one('SELECT * FROM lead_claims WHERE lead_id=?', (lead['id'],))
+            existing = await self.db.one('SELECT * FROM clients WHERE contact_id=? AND merged_into IS NULL AND identity_verified=1', (contact['id'],)) if verified else None
+            if owner and owner['subscription_id'] != sub['id']:
+                owner_client = await self.db.canonical(owner['client_id']) if owner['client_id'] else None
+                permitted = method == 'admin' or (verified and owner_client and owner_client['identity_verified'] and owner_client['contact_id'] == contact['id'])
+                if not permitted:
+                    await self.db.event('sync_conflict', sub['id'], source['id'], {'lead_id': lead['id']})
+                    return False
+                if not owner_client and method == 'admin':
+                    await self.db.execute('UPDATE subscriptions SET claimed_lead_id=NULL,crm_method=NULL WHERE id=?',(owner['subscription_id'],))
+                    await self.db.execute('UPDATE lead_claims SET subscription_id=?,client_id=?,method=? WHERE lead_id=?',(sub['id'],source['id'],method,lead['id']))
+                    await self.db.event('claim_reassigned_by_admin',sub['id'],source['id'],{'lead_id':lead['id'],'previous_subscription_id':owner['subscription_id'],'actor':actor})
+                    owner_client = source
+                if not owner_client:
+                    return False
+                existing = owner_client or existing
+            target = existing or source
+            if verified:
+                canonical_contact = await self.db.one('SELECT * FROM clients WHERE contact_id=? AND merged_into IS NULL', (contact['id'],))
+                if canonical_contact and canonical_contact['id'] != target['id']:
+                    if not canonical_contact['identity_verified']:
+                        return False
+                    target = canonical_contact
+            cid = await self.merge(source, target)
+            if not owner:
+                await self.db.execute('INSERT INTO lead_claims VALUES(?,?,?,?,?,?,?,?)', (lead['id'], sub['id'], cid, method, lead['pipeline_id'], lead['status_id'], stamp(), stamp()))
+            else:
+                await self.db.execute('UPDATE lead_claims SET client_id=?,pipeline_id=?,status_id=?,checked_at=? WHERE lead_id=?', (cid, lead['pipeline_id'], lead['status_id'], stamp(), lead['id']))
+            segment = 'completed' if any(x['pipeline_id'] == self.config.completed_pipeline_id for x in actual_leads) else 'active'
+            await self.db.execute("UPDATE clients SET segment=?,segment_source='crm',last_crm_check=?,identity_verified=MAX(identity_verified,?) WHERE id=?", (segment, stamp(), int(verified), cid))
+            if verified:
+                await self.db.execute('UPDATE clients SET contact_id=?,name=? WHERE id=?', (contact['id'], contact.get('name',''), cid))
+                await self.db.execute("INSERT INTO bindings(subscription_id,contact_id,lead_id,method,verified_by,created_at,crm_phones) VALUES(?,?,?,?,?,?,?) ON CONFLICT(subscription_id,contact_id,lead_id) DO UPDATE SET method=excluded.method,crm_phones=excluded.crm_phones", (sub['id'], contact['id'], lead['id'], method, actor, stamp(), dumps(sorted(contact_phones(contact)))))
+            await self.db.execute("UPDATE subscriptions SET client_id=?,claimed_lead_id=?,crm_method=?,identity_verified=MAX(identity_verified,?),state='confirmed' WHERE id=?", (cid, lead['id'], method, int(verified), sub['id']))
+            await self.cache_lead(lead)
+            key = f"subscription-{sub['id']}-lead-{lead['id']}"
+            old = await self.db.one('SELECT 1 FROM crm_notes WHERE lead_id=? AND key LIKE ?', (lead['id'], f"subscription-{sub['id']}-%"))
+            if not old:
+                date = datetime.fromisoformat(sub['subscribed_at']).astimezone(ZoneInfo('Asia/Krasnoyarsk')).strftime('%d.%m.%Y %H:%M')
+                text = f"Клиент подписался на официальный бот Синай | {sub['platform']} | ID пользователя: {sub['user_id']} | {date} | {'Действующий клиент' if segment=='active' else 'Процедура завершена'} | Метод: {method} | Личность: {'подтверждена телефоном' if verified else 'не подтверждена'}"
+                await self.db.execute('INSERT OR IGNORE INTO crm_notes(key,lead_id,text,created_at) VALUES(?,?,?,?)', (key, lead['id'], text, stamp()))
+                await self.db.enqueue('note:'+key, 'note', {'key': key})
+                await self.db.event('matched_auto' if verified else 'matched_unverified', sub['id'], cid, {'method': method, 'lead_id': lead['id'], 'actor': actor})
+        return True
+
+    async def sync(self, sub_id, **_legacy):
+        sub = await self.db.one('SELECT * FROM subscriptions WHERE id=?', (sub_id,))
+        if not sub or sub['stopped'] or not sub['phone'] or not sub['client_id'] or sub['identity_verified']:
+            return
+        pairs = []
+        for item in await self.crm.by_phone(sub['phone']):
+            contact = await self.crm.contact(item['id'])
+            if sub['phone'] in contact_phones(contact):
+                pairs.extend((contact, lead) for lead in await self.crm.leads_for(contact))
+        if len(pairs) == 1:
+            contact, lead = pairs[0]
+            if sub['claimed_lead_id'] and sub['claimed_lead_id'] != lead['id']:
+                await self.db.event('phone_lead_mismatch', sub['id'], sub['client_id'])
                 return
-        if candidate["lead_id"] not in {x["id"] for x in contact.get("_embedded", {}).get("leads", [])}:
-            raise ValueError("Контакт больше не связан с указанной сделкой. Повторите проверку.")
-        if method != "manual" and sub["phone"] not in contact_phones(contact):
-            raise ValueError("Телефон в CRM изменился; требуется ручная проверка.")
-        all_leads = await self.crm.leads_for(contact)
-        lead = next(x for x in all_leads if x["id"] == candidate["lead_id"])
-        completed = any(x["pipeline_id"] == self.config.completed_pipeline_id for x in all_leads)
-        segment = "completed" if completed else (sub["selected_segment"] or "active")
-        async with self.db.transaction():
-            if review_id:
-                review = await self.db.one("SELECT * FROM reviews WHERE id=? AND status='pending'", (review_id,))
-                if not review or review["subscription_id"] != sub["id"]:
-                    return
-            existing = await self.db.one("SELECT * FROM clients WHERE contact_id=?", (contact["id"],))
-            if existing:
-                client_id = existing["id"]
-                anchor = min(existing["subscribed_at"], sub["subscribed_at"])
-                segment = "completed" if existing["segment"] == "completed" else segment
-                await self.db.execute("UPDATE clients SET name=?,subscribed_at=?,segment=?,opted_out=0 WHERE id=?",
-                                      (contact.get("name", ""), anchor, segment, client_id))
-            else:
-                cursor = await self.db.execute("INSERT INTO clients(contact_id,name,segment,subscribed_at,preferred_platform,segment_source,created_at) VALUES(?,?,?,?,?,?,?)",
-                                               (contact["id"], contact.get("name", ""), segment, sub["subscribed_at"],
-                                                self.config.preferred_platform, "crm" if completed else "selection", stamp()))
-                client_id = cursor.lastrowid
-            await self.db.execute("UPDATE subscriptions SET client_id=?,name=?,state='confirmed',stopped=0,blocked=0 WHERE id=?",
-                                  (client_id, contact.get("name", ""), sub["id"]))
-            replaced = await self.db.all("SELECT contact_id,lead_id,method FROM bindings WHERE subscription_id=? AND (contact_id<>? OR lead_id<>?)",
-                                         (sub["id"], contact["id"], lead["id"]))
-            if replaced:
-                await self.db.event("bindings_replaced", sub["id"], client_id, {"previous": replaced, "actor": actor, "method": method})
-                await self.db.execute("DELETE FROM bindings WHERE subscription_id=? AND (contact_id<>? OR lead_id<>?)",
-                                      (sub["id"], contact["id"], lead["id"]))
-            await self.db.execute("INSERT INTO bindings(subscription_id,contact_id,lead_id,method,verified_by,created_at,crm_phones) VALUES(?,?,?,?,?,?,?) "
-                                  "ON CONFLICT(subscription_id,contact_id,lead_id) DO UPDATE SET method=excluded.method,verified_by=excluded.verified_by,crm_phones=excluded.crm_phones",
-                                  (sub["id"], contact["id"], lead["id"], method, actor, stamp(), dumps(sorted(contact_phones(contact)))))
-            for item in all_leads:
-                await self.cache_lead(item)
-            await self.db.execute("UPDATE clients SET last_crm_check=? WHERE id=?", (stamp(), client_id))
-            if review_id:
-                await self.db.execute("UPDATE reviews SET status='confirmed',resolved_at=?,resolved_by=? WHERE id=?",
-                                      (stamp(), actor, review_id))
-            else:
-                await self.db.execute("UPDATE reviews SET status='superseded',resolved_at=? WHERE subscription_id=? AND status='pending'", (stamp(), sub["id"]))
-            if sub["deep_token_hash"]:
-                await self.db.execute("UPDATE links SET consumed_at=? WHERE token_hash=?", (stamp(), sub["deep_token_hash"]))
-                await self.db.execute("UPDATE subscriptions SET deep_token_hash=NULL WHERE id=?", (sub["id"],))
-            key = f"subscription-{sub['id']}-contact-{contact['id']}-lead-{lead['id']}"
-            date = datetime.fromisoformat(sub["subscribed_at"]).astimezone(ZoneInfo("Asia/Krasnoyarsk")).strftime("%d.%m.%Y %H:%M")
-            text = f"Клиент подписался на официальный бот Синай | {'Telegram' if sub['platform']=='telegram' else 'MAX'} | {date} | {SEGMENTS[segment]} | Контакт CRM: {contact['id']}"
-            await self.db.execute("INSERT OR IGNORE INTO crm_notes(key,lead_id,text,created_at) VALUES(?,?,?,?)", (key, lead["id"], text, stamp()))
-            await self.db.enqueue("note:" + key, "note", {"key": key})
-            await self.db.event("matched_manual" if method == "manual" else "matched_auto", sub["id"], client_id, {"method": method, "lead_id": lead["id"], "actor": actor})
-            await self.tell_sub(sub, "Регистрация завершена. Вы подписаны на новости компании «Синай». /stop — отписка; /channel — выбрать этот канал для рассылок.")
+            await self.attach(sub, lead, 'phone', contact)
+        else:
+            await self.db.event('phone_unmatched' if not pairs else 'phone_ambiguous', sub['id'], sub['client_id'])
 
     async def cache_lead(self, lead):
-        await self.db.execute("INSERT INTO leads VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET pipeline_id=excluded.pipeline_id,status_id=excluded.status_id,checked_at=excluded.checked_at",
-                              (lead["id"], lead["pipeline_id"], lead["status_id"], stamp()))
+        await self.db.execute('INSERT INTO leads VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET pipeline_id=excluded.pipeline_id,status_id=excluded.status_id,checked_at=excluded.checked_at', (lead['id'], lead['pipeline_id'], lead['status_id'], stamp()))
 
     async def reconcile_client(self, client_id):
-        client = await self.db.one("SELECT * FROM clients WHERE id=?", (client_id,))
+        client = await self.db.canonical(client_id)
         if not client:
             return
-        contact = await self.crm.contact(client["contact_id"])
-        leads = await self.crm.leads_for(contact)
-        linked = {x["id"] for x in leads}
-        bindings = await self.db.all("SELECT b.*,s.* FROM bindings b JOIN subscriptions s ON s.id=b.subscription_id WHERE s.client_id=?", (client_id,))
-        # Missing/changed relationships pause sending and go to manual review.
-        for sub in bindings:
-            verified_override = sub["method"] == "manual" and json.loads(sub["crm_phones"]) == sorted(contact_phones(contact))
-            if sub["lead_id"] not in linked or (sub["phone"] not in contact_phones(contact) and not verified_override):
-                if sub["state"] == "confirmed":
-                    await self.review(sub, await self.candidates([contact]), "В CRM изменился телефон или связь со сделкой")
+        subs = await self.db.all('SELECT * FROM subscriptions WHERE client_id=? AND claimed_lead_id IS NOT NULL', (client['id'],))
+        if not subs:
+            return
+        leads = [await self.crm.lead(lid) for lid in sorted({s['claimed_lead_id'] for s in subs})]
+        if client['identity_verified'] and client['contact_id']:
+            leads.extend(await self.crm.leads_for(await self.crm.contact(client['contact_id'])))
+        segment = 'completed' if any(x['pipeline_id'] == self.config.completed_pipeline_id for x in leads) else 'active'
         async with self.db.transaction():
             for lead in leads:
                 await self.cache_lead(lead)
-            if any(x["pipeline_id"] == self.config.completed_pipeline_id for x in leads) and client["segment"] != "completed":
-                await self.db.execute("UPDATE clients SET segment='completed',segment_source='crm' WHERE id=?", (client_id,))
-                await self.db.event("segment_completed", client_id=client_id)
-            # Completed is sticky. Returning to active requires an explicit admin decision.
-            await self.db.execute("UPDATE clients SET name=?,last_crm_check=? WHERE id=?", (contact.get("name", ""), stamp(), client_id))
+            await self.db.execute("UPDATE clients SET segment=?,segment_source='crm',last_crm_check=? WHERE id=?", (segment, stamp(), client['id']))
+            if client['segment'] != segment:
+                await self.db.event('segment_'+segment, client_id=client['id'])
 
     async def reconcile_lead(self, lead_id):
-        # Always read the actual card, never trust pipeline/status from a webhook.
-        lead = await self.crm.lead(lead_id)
-        await self.cache_lead(lead)
-        ids = {x["id"] for x in lead.get("_embedded", {}).get("contacts", [])}
-        clients = await self.db.all("SELECT id,contact_id FROM clients")
-        for client in clients:
-            if client["contact_id"] in ids or await self.db.one("SELECT 1 FROM bindings b JOIN subscriptions s ON s.id=b.subscription_id WHERE b.lead_id=? AND s.client_id=?", (lead_id, client["id"])):
-                await self.reconcile_client(client["id"])
-
-    async def manager_link(self, incoming):
-        try:
-            if incoming.callback:
-                _, lead_id, contact_id = incoming.callback.split(":")
-                lead_id, contact_id = int(lead_id), int(contact_id)
-            else:
-                parts = incoming.text.split()
-                if len(parts) not in (2, 3):
-                    raise ValueError("Используйте /link ID_сделки [ID_контакта] или /link URL_сделки.")
-                lead_id = parse_lead(parts[1], self.config.amocrm_base_url)
-                contact_id = int(parts[2]) if len(parts) == 3 else None
-            lead = await self.crm.lead(lead_id)
-            contacts = lead.get("_embedded", {}).get("contacts", [])
-            if contact_id is None and len(contacts) == 1:
-                contact_id = contacts[0]["id"]
-            if contact_id is None:
-                await self.say(incoming, "У сделки несколько контактов или контакты отсутствуют. Укажите /link ID_сделки ID_контакта.\n" +
-                               "\n".join(f"Контакт {x['id']}: {self.config.amocrm_base_url}/contacts/detail/{x['id']}" for x in contacts[:15]))
-                return
-            if contact_id not in {x["id"] for x in contacts}:
-                raise ValueError("Указанный контакт не связан со сделкой.")
-            contact = await self.crm.contact(contact_id)
-            actor = f"{incoming.platform}:{incoming.user_id}"
-            urls = []
-            async with self.db.transaction():
-                for platform, username in [("telegram", self.config.tg_bot_username), ("max", self.config.max_bot_username)]:
-                    if username:
-                        urls.append((platform, await issue(self.db, self.config, platform, lead_id, contact_id, actor)))
-                await self.db.event("link_issued", detail={"actor": actor, "lead_id": lead_id, "contact_id": contact_id})
-            await self.say(incoming, f"🔗 {contact.get('name','')}\nСделка {lead_id}, контакт {contact_id}\nОдноразовые ссылки действуют {self.config.link_ttl_seconds//3600} ч.\n" +
-                           "\n".join(f"{p}: {url}" for p, url in urls) + ("\nMAX: заполните MAX_BOT_USERNAME." if not self.config.max_bot_username else ""),
-                           [[link_button("Открыть сделку", f"{self.config.amocrm_base_url}/leads/detail/{lead_id}")]])
-        except (ValueError, KeyError) as exc:
-            await self.say(incoming, str(exc))
+        for row in await self.db.all('SELECT DISTINCT client_id FROM subscriptions WHERE claimed_lead_id=? AND client_id IS NOT NULL', (lead_id,)):
+            await self.reconcile_client(row['client_id'])

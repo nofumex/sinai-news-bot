@@ -3,7 +3,7 @@ import hmac
 import ssl
 import vobject
 from .base import Incoming
-from ..http import HTTP, APIError, AmbiguousSend
+from ..http import HTTP, APIError, AmbiguousSend, RetryLater
 from ..matching import phone
 
 
@@ -14,11 +14,14 @@ class Max:
         if config.max_ca_bundle:
             context.load_verify_locations(config.max_ca_bundle)
         self.http = http or HTTP("max", interval=0.55, verify=context)
+        self.poll_http = HTTP('max-poll', interval=config.max_poll_min_seconds, verify=context)
         self.base = "https://platform-api2.max.ru"
 
     async def call(self, method, path, *, params=None, json=None, safe=False):
         data = await self.http.request(method, self.base + path, params=params, json=json, safe=safe,
                                        headers={"Authorization": self.config.max_bot_token.get_secret_value()})
+        if data.get('code') == 'attachment.not.ready':
+            raise RetryLater('max',15)
         if data.get("success") is False:
             raise APIError("max", 400, "unsuccessful_result")
         return data
@@ -67,7 +70,17 @@ class Max:
                         if x.get("type") == "contact"), None) if not callback else None
         return Incoming("max", user["user_id"], message.get("recipient", {}).get("chat_id", user["user_id"]),
                         body.get("text") or "", callback.get("payload", ""),
-                        callback.get("callback_id", ""), contact)
+                        callback.get("callback_id", ""), contact, raw=message)
+
+    async def poll(self, cursor):
+        params = {'timeout': self.config.poll_timeout, 'limit': 100,
+                  'types': 'bot_started,bot_stopped,message_created,message_callback'}
+        if cursor is not None:
+            params['marker'] = int(cursor)
+        data = await self.poll_http.request('GET', self.base+'/updates', params=params,
+                                            headers={'Authorization': self.config.max_bot_token.get_secret_value()},
+                                            timeout=self.config.poll_timeout+10)
+        return data.get('updates', []), data.get('marker')
 
     def verify_contact(self, payload, user_id):
         raw = payload.get("vcf_info", "")

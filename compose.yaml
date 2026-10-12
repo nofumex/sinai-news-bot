@@ -8,12 +8,10 @@ services:
     volumes:
       - ./config:/app/config
       - ./data:/app/data
-    expose:
-      - "8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
+      test: ["CMD", "sinai", "health"]
       interval: 30s
-      timeout: 6s
+      timeout: 5s
       retries: 3
     init: true
     security_opt:
@@ -24,26 +22,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    environment:
-      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in .env to a real public DNS name}
-    ports:
-      - "443:443"
-      - "80:80"
-    volumes:
-      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      bot:
-        condition: service_healthy
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-volumes:
-  caddy_data:
-  caddy_config:
