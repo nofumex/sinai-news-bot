@@ -1,0 +1,23 @@
+[Unit]
+Description=Sinai Telegram/MAX CRM bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sinai
+Group=sinai
+WorkingDirectory=/opt/sinai-crm-bot
+ExecStart=/opt/sinai-crm-bot/.venv/bin/sinai serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sinai-crm-bot/data /opt/sinai-crm-bot/config
+Environment=ENV_PATH=/opt/sinai-crm-bot/config/.env
+Environment=DATABASE_PATH=/opt/sinai-crm-bot/data/sinai.sqlite3
+
+[Install]
+WantedBy=multi-user.target

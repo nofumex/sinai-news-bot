@@ -1,0 +1,1 @@
+"""Official Sinai subscription service."""

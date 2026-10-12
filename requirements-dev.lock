@@ -1,0 +1,10 @@
+-r requirements.lock
+colorama==0.4.6
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.6.0
+pygments==2.21.0
+pytest==8.4.2
+pytest-asyncio==0.26.0
+respx==0.23.1
+ruff==0.17.0
